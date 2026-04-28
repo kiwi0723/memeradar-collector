@@ -1735,11 +1735,11 @@ def track_momentum(tokens):
 
 def format_momentum_alert(token, pct_gain, rounds, vol_up, stars, narrative_tag, desc_info=None, seen_count=0):
     """持续上涨动量推送 — 简化直观格式"""
-    chain_map = {'sol': '🔵 SOL', 'eth': '🟣 ETH', 'bsc': '🟡 BSC', 'base': '🔵 BASE'}
+    chain_map = {'sol': 'SOL', 'eth': 'ETH', 'bsc': 'BSC', 'base': 'BASE'}
     ch = chain_map.get(token['chain'], token['chain'].upper())
     vol_tag = "📈放量" if vol_up else "📊"
     star_str = "★" * stars + "☆" * (3 - stars)
-    chain_icon = {'sol': '🔵', 'eth': '🟣', 'bsc': '🟡', 'base': '🔵'}.get(token['chain'], '⚪')
+    chain_icon = {'sol': '🟣', 'eth': '🔵', 'bsc': '🟡', 'base': '🔵'}.get(token['chain'], '⚪')
 
     msg = (
         f"{chain_icon} {ch} | {narrative_tag}\n"
