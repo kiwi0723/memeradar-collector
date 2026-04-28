@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-叙事雷达 → 链上雷达 v1
+|叙事雷达 → 链上雷达 v2
 纯Python，零AI成本（关键词匹配 + 叙事去重）
 
 推送策略：只推★★★级叙事（马斯克/川普 + 币安/CZ/何一）
@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import hashlib
+import subprocess  # for onchainos CLI calls
 from datetime import datetime, timedelta
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -88,6 +89,15 @@ MUSK_TRUMP_KEYWORDS = {
     'floki', 'shiba',  # 只在新币上下文中用
     'doge father', 'dogefather', 'technoking',
     'mars colony', 'mars',
+    # 太空/SpaceX 相关（马斯克回复太空话题时触发，如 Polaris Dawn / 零重力柴犬）
+    'polaris', 'polaris dawn', 'zero gravity', 'zero-g',
+    'space mascot', 'space dog', 'space cat',
+    'mascot',  # 马斯克曾回复"Asteroid into SpaceX's mascot"
+    'astronaut', 'astronaut dog', 'rocket dog',
+    'spacecraft', 'dragon capsule', 'crew dragon',
+    # Polaris Dawn 任务相关 — 柴犬零重力指示器
+    'zero-g indicator', 'zero gravity indicator',
+    'plush', 'plush toy',  # 毛绒玩具零重力指示器
     # 川普核心
     'trump', 'donald', 'maga', 'potus', 'trump47',
     'melania', 'barron', 'ivanka',
@@ -669,6 +679,20 @@ def extract_meme_signals(text):
 
     return signals
 
+# Nitter RSS 备用实例（Nitter 经常挂，多路尝试提高成功率）
+NITTER_INSTANCES = [
+    'nitter.net',
+    'nitter.poast.org',
+    'nitter.kavin.rocks',
+    'nitter.space',
+    'nitter.cz',
+    'nitter.1d4.us',
+    'nitter.actionsack.com',
+    'nitter.vxempire.xyz',
+    'nitter.tokhmi.xyz',
+    'nitter.xyz',
+]
+
 def fetch_twitter_keywords():
     """拉取监控账号最新推文，提取关键词注入 HOT_TWITTER_KEYWORDS"""
     global HOT_TWITTER_KEYWORDS, HOT_KEYWORDS_LAST_FETCH
@@ -683,58 +707,88 @@ def fetch_twitter_keywords():
     HOT_TWITTER_KEYWORDS = {k: v for k, v in HOT_TWITTER_KEYWORDS.items() if v['expire'] > now}
     
     import xml.etree.ElementTree as ET
+    import html as html_mod
     
-    headers = {'User-Agent': 'RSS Reader'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
     new_count = 0
     
+    # 1. 尝试多路 Nitter RSS 实例
     for account, category in MONITORED_ACCOUNTS.items():
+        fetched = False
+        for instance in NITTER_INSTANCES:
+            if fetched:
+                break
+            try:
+                url = f'https://{instance}/{account}/rss'
+                resp = requests.get(url, headers=headers, timeout=8)
+                if resp.status_code != 200 or len(resp.text) < 100:
+                    continue
+                
+                root = ET.fromstring(resp.text)
+                items = root.findall('.//item')[:8]
+                if not items:
+                    continue
+                
+                fetched = True
+                for item in items:
+                    title_el = item.find('title')
+                    desc_el = item.find('description')
+                    title = title_el.text if title_el is not None and title_el.text else ''
+                    desc = desc_el.text if desc_el is not None and desc_el.text else ''
+                    
+                    desc = html_mod.unescape(desc)
+                    desc = re.sub(r'<[^>]+>', '', desc)
+                    desc = re.sub(r'https?://\\S+', '', desc)
+                    
+                    combined = f"{title} {desc}"
+                    kws = extract_meme_signals(combined)
+                    
+                    for kw, score in kws.items():
+                        if score < 5:
+                            continue
+                        if kw not in HOT_TWITTER_KEYWORDS:
+                            HOT_TWITTER_KEYWORDS[kw] = {'expire': now + HOT_KEYWORDS_TTL, 'category': category}
+                            new_count += 1
+                        elif score > HOT_TWITTER_KEYWORDS[kw].get('score', 5):
+                            HOT_TWITTER_KEYWORDS[kw] = {'expire': now + HOT_KEYWORDS_TTL, 'category': category, 'score': score}
+            except Exception as e:
+                log(f"[推特] {account}@{instance} 拉取失败: {e}")
+        
+        if not fetched:
+            log(f"[推特] {account}: 所有Nitter实例均不可用")
+    
+    # 2. 后备：OKX hot-tokens X mentions 数据提取热门代币名
+    if new_count == 0:
         try:
-            url = f'https://nitter.net/{account}/rss'
-            resp = requests.get(url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                continue
-            
-            root = ET.fromstring(resp.text)
-            items = root.findall('.//item')[:8]  # 每人取最新8条
-            
-            for item in items:
-                title_el = item.find('title')
-                desc_el = item.find('description')
-                title = title_el.text if title_el is not None and title_el.text else ''
-                desc = desc_el.text if desc_el is not None and desc_el.text else ''
-                
-                # 清洗HTML
-                import html
-                desc = html.unescape(desc)
-                desc = re.sub(r'<[^>]+>', '', desc)
-                desc = re.sub(r'https?://\S+', '', desc)
-                
-                combined = f"{title} {desc}"
-                kws = extract_meme_signals(combined)
-                
-                for kw, score in kws.items():
-                    if score < 5:  # 只取 meme 强度 ≥5 的关键词
-                        continue
-                    if kw not in HOT_TWITTER_KEYWORDS:
-                        HOT_TWITTER_KEYWORDS[kw] = {'expire': now + HOT_KEYWORDS_TTL, 'category': category}
+            result = subprocess.run(
+                ['onchainos', 'token', 'hot-tokens', '--ranking-type', '5', '--chain', '1', '--limit', '20'],
+                capture_output=True, text=True, timeout=15
+            )
+            okx_data = json.loads(result.stdout)
+            for t in okx_data.get('data', []):
+                symbol = t.get('tokenSymbol', '')
+                mentions = int(t.get('mentionsCount', 0))
+                if symbol and mentions >= 5 and len(symbol) >= 2:
+                    sk = symbol.lower()
+                    if sk not in HOT_TWITTER_KEYWORDS:
+                        HOT_TWITTER_KEYWORDS[sk] = {'expire': now + HOT_KEYWORDS_TTL, 'category': 'musk_trump', 'score': 5, 'source': 'okx_mentions'}
                         new_count += 1
-                    elif score > HOT_TWITTER_KEYWORDS[kw].get('score', 5):
-                        # 如果新推文的词分数更高，更新时间
-                        HOT_TWITTER_KEYWORDS[kw] = {'expire': now + HOT_KEYWORDS_TTL, 'category': category, 'score': score}
         except Exception as e:
-            log(f"[推特] {account} 拉取失败: {e}")
+            log(f"[推特] OKX mentions 后备拉取失败: {e}")
     
     if new_count > 0:
         log(f"[推特] 本轮新增 {new_count} 个热点关键词，总计 {len(HOT_TWITTER_KEYWORDS)} 个")
 
 def reverse_twitter_check(name, symbol, chain, description=''):
     """
-    🔄 反向检测 v2：链上动量触发时，立刻查推特。
-
-    两个层面：
-    A — 全局推特搜索：用 Nitter 搜索 token name/symbol，不限账号
-    B — 模糊语义匹配：不光精确匹配，还做部分词匹配 + description 补充
-
+    🔄 反向检测 v3：链上动量触发时，立刻查推特。
+    
+    v3 增强：
+    1. 多路 Nitter 实例搜索（提高成功率）
+    2. 搜索范围扩大到 description 概念词（包括太空/SpaceX相关）
+    3. 增加 concept-level 匹配：token 概念词匹配推文语义，即使无精确 token 名也能命中
+    4. 监控账号 RSS 多路备用实例
+    
     返回：{'category': 'musk_trump'|'binance_cz', 'keywords': [...], 'account': str, 'snippet': str, 'source': 'search'|'monitored'} 或 None
     """
     import xml.etree.ElementTree as ET
@@ -761,79 +815,78 @@ def reverse_twitter_check(name, symbol, chain, description=''):
     orig_name_lower = name.lower().strip()
     if len(orig_name_lower.split()) >= 2 and orig_name_lower not in noise_words:
         search_terms.append(orig_name_lower)
+    
+    # 额外：从 description 提取概念关键词（增强覆盖）
+    # 比如 token 说"inspired by Polaris Dawn zero-gravity Shiba" → search 也搜 "polaris dawn zero gravity"
+    concept_keywords = _extract_concept_keywords(description)
+    for ck in concept_keywords:
+        if ck not in search_terms and len(ck) >= 3:
+            search_terms.append(ck)
 
     log(f"[反向检测] {name}({symbol}) on {chain} 链上异动，推特搜索: {search_terms[:3]}...")
 
-    def _search_twitter(query, max_results=15):
-        """Nitter 搜索，返回原始推文列表"""
+    def _search_twitter_nitter(query, max_results=15):
+        """多路 Nitter 搜索，返回原始推文列表"""
         tweets = []
-        try:
-            # Nitter 搜索：q= 参数
-            url = f'https://nitter.net/search?f=tweets&q={requests.utils.quote(query)}'
-            resp = requests.get(url, headers={**headers, 'Accept': 'text/html'}, timeout=15)
-            if resp.status_code != 200:
-                return tweets
-            
-            # Nitter 搜索返回 HTML，用简单 regex 提取推文
-            html_text = resp.text
-            
-            # 提取推文卡片 — Nitter HTML 结构
-            # 每个推文在 <div class="timeline-item"> 中
-            tweet_blocks = re.findall(
-                r'<div class="timeline-item[^"]*".*?</div>\s*</div>\s*</div>\s*</div>',
-                html_text, re.DOTALL
-            )
-            
-            for block in tweet_blocks[:max_results]:
-                # 提取用户名
-                user_match = re.search(r'<a[^>]*class="username"[^>]*>([^<]+)</a>', block)
-                user = html_mod.unescape(user_match.group(1).strip()) if user_match else ''
+        for instance in NITTER_INSTANCES:
+            if tweets:
+                break
+            try:
+                url = f'https://{instance}/search?f=tweets&q={requests.utils.quote(query)}'
+                resp = requests.get(url, headers={**headers, 'Accept': 'text/html'}, timeout=10)
+                if resp.status_code != 200 or len(resp.text) < 200:
+                    continue
                 
-                # 提取推文内容（tweet-content）
-                content_match = re.search(
-                    r'<div class="tweet-content[^"]*"[^>]*>(.*?)</div>',
-                    block, re.DOTALL
+                html_text = resp.text
+                
+                # 提取推文卡片 — Nitter HTML 结构
+                tweet_blocks = re.findall(
+                    r'<div class="timeline-item[^"]*".*?</div>\s*</div>\s*</div>\s*</div>',
+                    html_text, re.DOTALL
                 )
-                if not content_match:
-                    continue
-                tweet_text_raw = content_match.group(1)
-                # 清洗 HTML
-                tweet_text = html_mod.unescape(tweet_text_raw)
-                tweet_text = re.sub(r'<br\s*/?>', ' ', tweet_text)
-                tweet_text = re.sub(r'<[^>]+>', '', tweet_text)
-                tweet_text = re.sub(r'https?://\S+', '', tweet_text)
-                tweet_text = re.sub(r'\s+', ' ', tweet_text).strip()
                 
-                if not tweet_text or len(tweet_text) < 10:
-                    continue
-                
-                tweets.append({
-                    'user': user,
-                    'text': tweet_text,
-                    'text_lower': tweet_text.lower(),
-                })
-        except Exception as e:
-            log(f"[反向检测] 搜索 '{query}' 失败: {e}")
+                for block in tweet_blocks[:max_results]:
+                    # 提取用户名
+                    user_match = re.search(r'<a[^>]*class="username"[^>]*>([^<]+)</a>', block)
+                    user = html_mod.unescape(user_match.group(1).strip()) if user_match else ''
+                    
+                    # 提取推文内容（tweet-content）
+                    content_match = re.search(
+                        r'<div class="tweet-content[^"]*"[^>]*>(.*?)</div>',
+                        block, re.DOTALL
+                    )
+                    if not content_match:
+                        continue
+                    tweet_text_raw = content_match.group(1)
+                    # 清洗 HTML
+                    tweet_text = html_mod.unescape(tweet_text_raw)
+                    tweet_text = re.sub(r'<br\s*/?>', ' ', tweet_text)
+                    tweet_text = re.sub(r'<[^>]+>', '', tweet_text)
+                    tweet_text = re.sub(r'https?://\S+', '', tweet_text)
+                    tweet_text = re.sub(r'\s+', ' ', tweet_text).strip()
+                    
+                    if not tweet_text or len(tweet_text) < 10:
+                        continue
+                    
+                    tweets.append({
+                        'user': user,
+                        'text': tweet_text,
+                        'text_lower': tweet_text.lower(),
+                    })
+            except Exception as e:
+                log(f"[反向检测] {instance} 搜索 '{query}' 失败: {e}")
         
         return tweets
 
     def _score_tweet(tweet_text, search_terms, token_keywords, description):
         """
         给一条推文的"相关性 + meme 潜力"打分。
-
-        核心原则：**没有精确匹配 = 不相关 = 0分**
-        MEME信号、description匹配等只能作为精确匹配之上的加分项。
-
-        匹配方式（从强到弱）：
-        1. 精确匹配 token name 完整词（必要前置条件）
-        2. 精确匹配 symbol
-        3. token 名作为子串出现在推文关键词中（"doge" in "doge department"）
-        4. description 中的词出现在推文中（加分项）
-        5. 推文高信号词（加分项）
+        核心原则：精确匹配优先，concept 匹配兜底
         """
         tl = tweet_text.lower()
         matched = set()
         score = 0
+        concept_boost = 0  # concept 匹配加分（不触发 15 分门槛）
         
         # 1. 精确匹配 token 关键词（必要前置条件）
         for kw in token_keywords:
@@ -847,20 +900,28 @@ def reverse_twitter_check(name, symbol, chain, description=''):
             matched.add(orig_name)
             score += 20
         
-        # ❗ 没有精确匹配 → 直接返回 0
-        # 避免完全不相关的 token 靠 MEME 信号词误判
-        if score < 15:
-            return 0, set()
-        
         # 3. 子串匹配 — token 关键词是推文某词的一部分
-        # 比如 token 叫 "doge" 而推文说 "doge department"
         for kw in token_keywords:
             if len(kw) >= 4 and kw not in matched:
                 if re.search(r'\b[a-z]*' + re.escape(kw) + r'[a-z]*\b', tl):
                     matched.add(f"{kw}*")
                     score += 10
         
-        # 4. description 补充匹配（加分项）
+        # 4. 🆕 Concept-level 匹配：从 description 提取的概念词命中
+        #    即使 token 名没有精确匹配，如果 description 概念词与推文关联度高 → 加分
+        concept_kws = _extract_concept_keywords(description)
+        concept_hits = [ck for ck in concept_kws if len(ck) >= 3 and ck in tl]
+        for ck in concept_hits:
+            matched.add(f"concept:{ck}")
+            concept_boost += 12  # 每个概念词 12 分
+        
+        # Concept 兜底：如果没有精确匹配(score<15)但 concept 分够高 → 仍有希望
+        effective_score = score + concept_boost
+        
+        if score < 15 and concept_boost < 15:
+            return 0, set()
+        
+        # 5. description 补充匹配（加分项）
         if description:
             desc_words = set(re.findall(r'[a-z]{4,}', description.lower()))
             # 去噪音
@@ -870,24 +931,33 @@ def reverse_twitter_check(name, symbol, chain, description=''):
             for dw in desc_words:
                 if dw in tl:
                     matched.add(f"desc:{dw}")
-                    score += 5
+                    effective_score += 5
         
-        # 5. MEME 信号评分 — 推文本身体现的 meme 潜力（加分项）
+        # 6. MEME 信号评分 — 推文本身体现的 meme 潜力（加分项）
         meme_sigs = extract_meme_signals(tweet_text)
         for sig, sig_score in meme_sigs.items():
             if sig_score >= 10:  # 高信号短语
                 matched.add(f"sig:{sig}")
-                score += sig_score // 3  # 降低 MEME 信号权重
+                effective_score += sig_score // 3
         
-        return score, matched
+        # 7. 🆕 大V提及加分：推文提到马斯克/川普/CZ等大V
+        for vip in ['@elonmusk', '@realdonaldtrump', '@cz_binance', '@heyibinance',
+                    'elon musk', 'donald trump', 'cz binance', 'changpeng zhao',
+                    'spacex', 'starship', 'polaris dawn']:
+            if vip in tl:
+                matched.add(f"vip:{vip.replace(' ', '_')}")
+                effective_score += 15
+                break  # 大V加分一次即可
+        
+        return effective_score, matched
 
     # ================================================================
-    # A: 全局推特搜索（不限账号）
+    # A: 全局推特搜索（不限账号）— 多路 Nitter 实例
     # ================================================================
     best_result = None  # (score, matched_keywords, user, snippet, source)
     
     for term in search_terms[:3]:  # 最多搜3个关键词
-        tweets = _search_twitter(term)
+        tweets = _search_twitter_nitter(term)
         for tw in tweets:
             s, matched = _score_tweet(tw['text'], search_terms, token_keywords, description)
             if s > 0:
@@ -898,41 +968,44 @@ def reverse_twitter_check(name, symbol, chain, description=''):
                     )
     
     # ================================================================
-    # B: 也查监控账号（原有逻辑的增强版）
+    # B: 也查监控账号（多路 RSS 实例）
     # ================================================================
     for account, category in MONITORED_ACCOUNTS.items():
-        try:
-            url = f'https://nitter.net/{account}/rss'
-            resp = requests.get(url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                continue
-            
-            root = ET.fromstring(resp.text)
-            items = root.findall('.//item')[:8]  # 放宽到8条
-            
-            for item in items:
-                title_el = item.find('title')
-                desc_el = item.find('description')
-                title = title_el.text if title_el is not None and title_el.text else ''
-                desc = desc_el.text if desc_el is not None and desc_el.text else ''
+        for instance in NITTER_INSTANCES:
+            try:
+                url = f'https://{instance}/{account}/rss'
+                resp = requests.get(url, headers=headers, timeout=8)
+                if resp.status_code != 200 or len(resp.text) < 100:
+                    continue
                 
-                desc = html_mod.unescape(desc)
-                desc = re.sub(r'<[^>]+>', '', desc)
-                desc = re.sub(r'https?://\S+', '', desc)
+                root = ET.fromstring(resp.text)
+                items = root.findall('.//item')[:8]
+                if not items:
+                    continue
                 
-                tweet_text = f"{title} {desc}"
-                s, matched = _score_tweet(tweet_text, search_terms, token_keywords, description)
-                
-                if s > 0:
-                    # 监控账号命中加成
-                    s += 25  # 大V推文权重更高
-                    if best_result is None or s > best_result[0]:
-                        best_result = (
-                            s, list(matched)[:6], f"@{account}",
-                            (title or desc)[:100], 'monitored'
-                        )
-        except Exception as e:
-            log(f"[反向检测] {account} 查询失败: {e}")
+                for item in items:
+                    title_el = item.find('title')
+                    desc_el = item.find('description')
+                    title = title_el.text if title_el is not None and title_el.text else ''
+                    desc = desc_el.text if desc_el is not None and desc_el.text else ''
+                    
+                    desc = html_mod.unescape(desc)
+                    desc = re.sub(r'<[^>]+>', '', desc)
+                    desc = re.sub(r'https?://\S+', '', desc)
+                    
+                    tweet_text = f"{title} {desc}"
+                    s, matched = _score_tweet(tweet_text, search_terms, token_keywords, description)
+                    
+                    if s > 0:
+                        # 监控账号命中加成
+                        s += 25  # 大V推文权重更高
+                        if best_result is None or s > best_result[0]:
+                            best_result = (
+                                s, list(matched)[:6], f"@{account}",
+                                (title or desc)[:100], 'monitored'
+                            )
+            except Exception as e:
+                log(f"[反向检测] {account}@{instance} 查询失败: {e}")
     
     if best_result:
         score, keywords, user, snippet, source = best_result
@@ -957,6 +1030,53 @@ def reverse_twitter_check(name, symbol, chain, description=''):
             'snippet': snippet,
             'source': source,
         }
+
+
+def _extract_concept_keywords(description):
+    """
+    从 token description 提取概念关键词，用于增强反向检测搜索和概念匹配。
+    
+    比如 description 中说 "inspired by Polaris Dawn zero-gravity Shiba Inu plush toy"
+    → 提取: polaris, dawn, zero, gravity, shiba, plush, toy, indicator, mascot
+    
+    重点识别：太空/SpaceX/马斯克相关概念
+    """
+    if not description or len(description) < 10:
+        return []
+    
+    desc_lower = description.lower()
+    keywords = set()
+    
+    # 太空/SpaceX 概念词库（匹配 description 中的内容）
+    SPACE_CONCEPTS = {
+        'polaris', 'dawn', 'zero', 'gravity', 'zero-g', 'zero-gravity',
+        'plush', 'mascot', 'indicator', 'spacex', 'space', 'starship',
+        'astronaut', 'rocket', 'capsule', 'dragon', 'crew',
+        'launch', 'mission', 'orbit', 'orbital',
+        'shiba inu', 'shiba', 'space dog', 'space cat',
+        'spacecraft', 'satellite', 'mars', 'moon', 'lunar',
+    }
+    
+    # 直接匹配整句概念
+    for concept in SPACE_CONCEPTS:
+        if concept in desc_lower:
+            keywords.add(concept)
+    
+    # 描述中的大写词（专有名词，如 Polaris Dawn, SpaceX 等）
+    cap_words = re.findall(r'\b([A-Z][a-z]{2,9})\b', description)
+    for cap in cap_words:
+        cl = cap.lower()
+        if cl not in {'the', 'this', 'that', 'with', 'from', 'they', 'have',
+                      'been', 'will', 'what', 'when', 'where', 'which', 'token',
+                      'coin', 'meme', 'project', 'community', 'also', 'just',
+                      'only', 'more', 'most', 'some', 'any', 'many', 'very'}:
+            keywords.add(cl)
+    
+    # 如果描述中有 $TICKER 格式
+    for t in re.findall(r'\$([A-Z][A-Z0-9]{1,9})', description):
+        keywords.add(t.lower())
+    
+    return list(keywords)
     
     log(f"[反向检测] ❌ 未命中任何推文")
     return None
@@ -1703,12 +1823,39 @@ def track_momentum(tokens):
         
         if category == 'musk_trump':
             stars = 3
-            prefix = "🔁 " if reverse_detected else ""
-            narrative_tag = f"{prefix}马斯克/川普概念 ({', '.join(matched_kw[:3])})"
+            if reverse_detected:
+                rev_acc = reverse_result.get('account', '')
+                if rev_acc:
+                    narrative_tag = f"🔁 {rev_acc}提及 ({', '.join(matched_kw[:3])})"
+                else:
+                    narrative_tag = f"🔁 推特提及 ({', '.join(matched_kw[:3])})"
+                # 将推文片段标注到描述中
+                rev_snip = reverse_result.get('snippet', '')[:60]
+                if rev_snip:
+                    orig_desc = desc_info.get('description', '') if isinstance(desc_info, dict) else ''
+                    if orig_desc:
+                        desc_info['description'] = f"推文: \"{rev_snip}\" | {orig_desc[:80]}"
+                    else:
+                        desc_info['description'] = f"推文: \"{rev_snip}\""
+            else:
+                narrative_tag = f"马斯克/川普概念 ({', '.join(matched_kw[:3])})"
         elif category == 'binance_cz':
             stars = 3
-            prefix = "🔁 " if reverse_detected else ""
-            narrative_tag = f"{prefix}币安/CZ概念 ({', '.join(matched_kw[:3])})"
+            if reverse_detected:
+                rev_acc = reverse_result.get('account', '')
+                if rev_acc:
+                    narrative_tag = f"🔁 {rev_acc}提及 ({', '.join(matched_kw[:3])})"
+                else:
+                    narrative_tag = f"🔁 推特提及 ({', '.join(matched_kw[:3])})"
+                rev_snip = reverse_result.get('snippet', '')[:60]
+                if rev_snip:
+                    orig_desc = desc_info.get('description', '') if isinstance(desc_info, dict) else ''
+                    if orig_desc:
+                        desc_info['description'] = f"推文: \"{rev_snip}\" | {orig_desc[:80]}"
+                    else:
+                        desc_info['description'] = f"推文: \"{rev_snip}\""
+            else:
+                narrative_tag = f"币安/CZ概念 ({', '.join(matched_kw[:3])})"
         elif category == 'meme_concept':
             stars = 3
             narrative_tag = f"🧠 MEME概念 ({', '.join(matched_kw[:3])})"
@@ -1941,7 +2088,7 @@ def scan_narratives():
 # ============================================================
 def main():
     log("=" * 50)
-    log("链上雷达 v1 启动")
+    log("链上雷达 v2 启动")
     log(f"扫描间隔: {SCAN_INTERVAL}s")
     log(f"推送逻辑: 动量优先 — 连涨才推，仅推★★★级叙事（马斯克/川普/币安/CZ/何一）")
     log("=" * 50)
@@ -1951,7 +2098,7 @@ def main():
     
     # 启动通知
     tg_send(
-        "链上雷达 v1 已启动\n"
+        "链上雷达 v2 已启动\n"
         "\n"
         "核心逻辑: 动量优先\n"
         "连涨3轮+涨幅>5% + 仅★★★叙事才推送\n"
