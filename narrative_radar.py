@@ -212,6 +212,24 @@ COMMON_NOISE_WORDS = {
 }
 
 # ============================================================
+# 通用 MEME 概念关键词（★★★ 级别，发现即推）
+# 只要代币名/描述里出现这些词，不论链、不看推文，直接推
+# ============================================================
+MEME_CONCEPT_KEYWORDS = {
+    # 百科全书/博物馆/档案馆 — meme 集合类
+    'encyclopedia', 'encyclopaedia', 'museum', 'archive', 'library',
+    'collection', 'gallery', 'compendium', 'almanac', 'anthology',
+    # 殿堂/神殿/教堂 — meme 信仰类
+    'temple', 'cathedral', 'church', 'shrine', 'monument',
+    'pantheon', 'hall of', 'halloffame',
+    # 史诗/传说/神话 — meme 故事类
+    'epic', 'legend', 'myth', 'saga', 'chronicle', 'odyssey',
+    # 宇宙/无限 — 概念类
+    'universe', 'multiverse', 'infinite', 'eternal', 'immortal',
+    'dimension', 'nexus', 'singularity',
+}
+
+# ============================================================
 # 工具函数
 # ============================================================
 def log(msg):
@@ -1030,8 +1048,18 @@ def classify_narrative(name, symbol, chain, description=''):
     
     if matched_cv:
         return ('celebrity_viral', matched_cv)
-    
-    # 5. 都不匹配 → 需要进一步检查是否全新叙事
+
+    # 5. 通用 MEME 概念检测 — 发现百科/博物馆/传奇等概念，直接 ★★★
+    matched_meme = []
+    text_for_meme = text_with_desc
+    for kw in MEME_CONCEPT_KEYWORDS:
+        if kw.lower() in text_for_meme:
+            matched_meme.append(kw)
+    if matched_meme:
+        # 所有链都推
+        return ('meme_concept', matched_meme)
+
+    # 6. 都不匹配 → 需要进一步检查是否全新叙事
     return ('check_novelty', None)
 
 # ============================================================
@@ -1654,9 +1682,9 @@ def track_momentum(tokens):
         # 叙事分类 → 星级评分（含描述匹配 + 推特热点关键词）
         category, matched_kw = classify_narrative(token['name'], token['symbol'], token['chain'], description)
         
-        # 🎯 只推送★★★级叙事（马斯克/川普、币安/CZ/何一）
+        # 🎯 只推送★★★级叙事（马斯克/川普、币安/CZ/何一、通用MEME概念）
         reverse_detected = False
-        if category not in ('musk_trump', 'binance_cz'):
+        if category not in ('musk_trump', 'binance_cz', 'meme_concept'):
             # 🔄 反向检测：链上异动 → 立刻查推特
             reverse_result = reverse_twitter_check(token['name'], token['symbol'], token['chain'], description)
             if reverse_result:
@@ -1681,6 +1709,9 @@ def track_momentum(tokens):
             stars = 3
             prefix = "🔁 " if reverse_detected else ""
             narrative_tag = f"{prefix}币安/CZ概念 ({', '.join(matched_kw[:3])})"
+        elif category == 'meme_concept':
+            stars = 3
+            narrative_tag = f"🧠 MEME概念 ({', '.join(matched_kw[:3])})"
         elif category == 'celebrity_viral':
             stars = 2
             narrative_tag = f"名人/热点 ({', '.join(matched_kw[:3])})"
