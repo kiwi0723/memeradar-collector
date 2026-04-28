@@ -1621,12 +1621,16 @@ def track_momentum(tokens):
         last_mc = recent[-1]['mc']
         pct_gain = ((last_mc - first_mc) / first_mc * 100) if first_mc > 0 else 0
         
-        # 推送条件：连续涨 + 涨幅>5%（SOL链meme太多，提高门槛到15%）
-        chain_min_gain = 15 if token['chain'] in ('sol', 'solana') else 5
+        # 推送条件：连续涨 + 涨幅（SOL链meme太多，大幅提高门槛）
+        chain_min_gain = 25 if token['chain'] in ('sol', 'solana') else 5
         if pct_gain < chain_min_gain:
             continue
-        
-        # 信号计数：同一个币每次触发信号，计数+1
+
+        # SOL链额外要求：市值 > $5000 才推（过滤纯土狗）
+        if token['chain'] in ('sol', 'solana') and mc < 5000:
+            continue
+
+        # 信号计数
         push_info = MOMENTUM_PUSHED.get(addr, {'count': 0, 'last_ts': 0, 'last_mc': 0})
         
         # 必须比上次推送时市值还高才推（真的还在涨）
@@ -1730,69 +1734,52 @@ def track_momentum(tokens):
     return alerts
 
 def format_momentum_alert(token, pct_gain, rounds, vol_up, stars, narrative_tag, desc_info=None, seen_count=0):
-    """持续上涨动量推送 — 带叙事星级"""
-    chain_map = {'sol': 'SOL', 'eth': 'ETH', 'bsc': 'BSC', 'base': 'BASE'}
+    """持续上涨动量推送 — 简化直观格式"""
+    chain_map = {'sol': '🔵 SOL', 'eth': '🟣 ETH', 'bsc': '🟡 BSC', 'base': '🔵 BASE'}
     ch = chain_map.get(token['chain'], token['chain'].upper())
-    
-    vol_tag = "放量" if vol_up else ""
+    vol_tag = "📈放量" if vol_up else "📊"
     star_str = "★" * stars + "☆" * (3 - stars)
-    
-    # 信号编号从标题移到下面
-    msg = f"链上雷达\
-"
-    msg += f"链: {ch}\
-\
-"
-    msg += f"{token['name']} ({token['symbol']})\
-"
-    msg += f"`{token['address']}`\
-\
-"
-    
-    # 故事描述
+    chain_icon = {'sol': '🔵', 'eth': '🟣', 'bsc': '🟡', 'base': '🔵'}.get(token['chain'], '⚪')
+
+    msg = (
+        f"{chain_icon} {ch} | {narrative_tag}\n"
+        f"\n"
+        f"**{token['name']}** `${token['symbol']}`\n"
+        f"`{token['address'][:8]}...{token['address'][-6:]}`\n"
+    )
+
     desc = (desc_info or {}).get('description', '')
     if desc:
-        if len(desc) > 200:
-            desc = desc[:200] + '...'
-        msg += f"故事: {desc}\
-\
-"
-    
-    msg += f"叙事: {narrative_tag}\
-"
-    msg += f"连涨{rounds}轮 +{pct_gain:.1f}% {vol_tag}\
-\
-"
-    msg += f"```\
-"
-    msg += f"市值     ${token['mc']:>12,.0f}\
-"
-    msg += f"流动性   ${token['liq']:>12,.0f}\
-"
-    msg += f"1h涨幅   {token['chg_1h']:>+11.1f}%\
-"
+        if len(desc) > 120:
+            desc = desc[:120] + '...'
+        msg += f"\n💬 {desc}\n"
+
+    msg += (
+        f"\n{vol_tag} 连涨{rounds}轮 `+{pct_gain:.1f}%`\n"
+        f"\n"
+        f"```\n"
+        f"市值 ${token['mc']:>9,.0f}\n"
+        f"池子 ${token['liq']:>9,.0f}\n"
+        f"1h   {token['chg_1h']:>+8.1f}%\n"
+    )
     if token.get('sm', 0) > 0:
-        msg += f"聪明钱   {token['sm']:>12d}\
-"
-    msg += f"币龄     {token['age_h']:>10.1f}h\
-"
-    msg += f"```\
-"
-    msg += f"评星: {star_str}  出现次数: {seen_count}"
-    
-    # 社交链接
+        msg += f"聪明  {token['sm']:>8d}\n"
+    msg += (
+        f"年龄  {token['age_h']:>7.1f}h\n"
+        f"```\n"
+        f"{star_str}  # {seen_count}"
+    )
+
     links = []
     if (desc_info or {}).get('twitter'):
-        links.append(f"\
-Twitter: {desc_info['twitter']}")
+        links.append(f"𝕏 {desc_info['twitter']}")
     if (desc_info or {}).get('telegram'):
-        links.append(f"TG: {desc_info['telegram']}")
+        links.append(f"📱 {desc_info['telegram']}")
     if (desc_info or {}).get('website'):
-        links.append(f"Web: {desc_info['website']}")
+        links.append(f"🌐 {desc_info['website']}")
     if links:
-        msg += '\
-'.join(links)
-    
+        msg += '\n' + '\n'.join(links)
+
     return msg
 
 def format_celebrity_alert(token, matched_kw, desc_info=None):
