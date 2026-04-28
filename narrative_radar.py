@@ -1894,7 +1894,10 @@ def track_momentum(tokens):
             else:
                 narrative_tag += " | 无社区链接"
         
-        msg = format_momentum_alert(token, pct_gain, len(recent), vol_increasing, stars, narrative_tag, desc_info, signal_count)
+        narrative_story = generate_narrative_story(
+            token['name'], token['symbol'], description, category, matched_kw
+        )
+        msg = format_momentum_alert(token, pct_gain, len(recent), vol_increasing, stars, narrative_tag, desc_info, signal_count, narrative_story)
         alerts.append({'msg': msg, 'token': token})
         MOMENTUM_PUSHED[addr] = push_info
         
@@ -1911,7 +1914,104 @@ def track_momentum(tokens):
     
     return alerts
 
-def format_momentum_alert(token, pct_gain, rounds, vol_up, stars, narrative_tag, desc_info=None, seen_count=0):
+def generate_narrative_story(name, symbol, description, category, matched_kw):
+    """
+    生成简短的叙事描述，用于推送消息中展示。
+    例如：'🐕 Shiba Inu太空衍生 · SpaceX mascot概念'
+    """
+    text = f"{name} {symbol}".lower()
+    text_with_desc = f"{name} {symbol} {description}".lower() if description else text
+    story_parts = []
+    
+    # 1. 类别基础描述
+    category_stories = {
+        'musk_trump': '🚀 马斯克/川普',
+        'binance_cz': '💰 币安/CZ',
+        'meme_concept': '🧠 MEME概念',
+        'celebrity_viral': '🎭 名人热点',
+    }
+    if category in category_stories:
+        story_parts.append(category_stories[category])
+    
+    # 2. 太空/SpaceX 概念检测
+    space_concepts = {
+        'polaris': 'Polaris Dawn', 'polaris dawn': 'Polaris Dawn',
+        'zero gravity': '零重力', 'zero-g': '零重力',
+        'spacex': 'SpaceX', 'space': '太空',
+        'starship': 'Starship', 'mars': '火星',
+        'astronaut': '宇航员', 'rocket': '火箭',
+        'dragon': '龙飞船', 'crew dragon': '龙飞船',
+        'space dog': '太空狗', 'space cat': '太空猫',
+        'mascot': '吉祥物', 'plush': '毛绒玩偶',
+        'shiba inu': '柴犬', 'shiba': '柴犬',
+    }
+    space_hits = []
+    for sc, label in space_concepts.items():
+        if sc in text_with_desc:
+            space_hits.append(label)
+    if space_hits:
+        unique_hits = []
+        seen = set()
+        for h in space_hits:
+            if h not in seen:
+                unique_hits.append(h)
+                seen.add(h)
+        story_parts.append(' · '.join(unique_hits[:3]))
+    
+    # 3. 川普相关
+    trump_concepts = {
+        'trump': 'Trump', 'maga': 'MAGA', 'donald': 'Trump',
+        'dark maga': 'Dark MAGA', 'potus': 'POTUS',
+        'melania': 'Melania', 'barron': 'Barron',
+        'covfefe': 'Covfefe', 'truth social': 'Truth Social',
+    }
+    trump_hits = [label for tc, label in trump_concepts.items() if tc in text_with_desc]
+    if trump_hits and '🚀 马斯克/川普' not in story_parts:
+        story_parts.append(' | '.join(trump_hits[:2]))
+    
+    # 4. 币安/CZ相关
+    cz_concepts = {
+        'cz': 'CZ', 'binance': 'Binance', 'bnb': 'BNB',
+        'pancake': 'Pancake', 'fourmeme': 'Four.Meme',
+        'heyi': '何一', 'yi he': '何一',
+        'cz dog': 'CZ小狗', 'bnb dog': 'BNB狗',
+        'bsc': 'BSC生态',
+    }
+    cz_hits = [label for cc, label in cz_concepts.items() if cc in text_with_desc]
+    if cz_hits:
+        story_parts.append(' | '.join(cz_hits[:2]))
+    
+    # 5. 从 description 抽取代币类型关键词
+    if description:
+        desc_lower = description.lower()
+        type_words = []
+        # MEME 类型
+        if any(w in desc_lower for w in ['meme', 'memecoin', 'meme coin']):
+            type_words.append('Memecoin')
+        if any(w in desc_lower for w in ['community', 'cto', 'community take over']):
+            type_words.append('社区驱动')
+        if any(w in desc_lower for w in ['defi', 'yield', 'staking', 'farm']):
+            type_words.append('DeFi')
+        if any(w in desc_lower for w in ['ai', 'artificial intelligence', 'agent']):
+            type_words.append('AI')
+        if any(w in desc_lower for w in ['charity', 'donation', 'donate']):
+            type_words.append('慈善')
+        if any(w in desc_lower for w in ['game', 'gaming', 'gamble']):
+            type_words.append('Gaming')
+        if type_words and '🧠 MEME概念' not in story_parts:
+            story_parts.append(' | '.join(type_words[:2]))
+    
+    if not story_parts:
+        # 兜底：用 normalize_theme
+        theme = normalize_theme(name, symbol)
+        if theme:
+            return f'📖 叙事: {theme}'
+        return ''
+    
+    return ' | '.join(story_parts)
+
+
+def format_momentum_alert(token, pct_gain, rounds, vol_up, stars, narrative_tag, desc_info=None, seen_count=0, narrative_story=''):
     """持续上涨动量推送 — 简化直观格式"""
     chain_map = {'sol': 'SOL', 'eth': 'ETH', 'bsc': 'BSC', 'base': 'BASE'}
     ch = chain_map.get(token['chain'], token['chain'].upper())
@@ -1925,6 +2025,9 @@ def format_momentum_alert(token, pct_gain, rounds, vol_up, stars, narrative_tag,
         f"**{token['name']}** `${token['symbol']}`\n"
         f"`{token['address'][:8]}...{token['address'][-6:]}`\n"
     )
+    
+    if narrative_story:
+        msg += f"\n📖 {narrative_story}\n"
 
     desc = (desc_info or {}).get('description', '')
     if desc:
