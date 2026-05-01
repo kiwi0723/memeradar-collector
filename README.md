@@ -1,4 +1,4 @@
-# MemeRadar Collector v5 — 链上叙事雷达
+# MemeRadar Collector v6 — 链上叙事雷达
 
 双源交叉验证信号采集器，实时扫描 GMGN + OKX 聪明钱/KOL 交易，通过 Hermes Agent 分析叙事后推送 Telegram。
 

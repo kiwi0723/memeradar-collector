@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Collector v5 — 双源交叉验证信号采集器 (retry + scoring)
+Collector v6 — 双源交叉验证信号采集器 (web叙事 + 四链)
 
 数据源:
   GMGN  — 主数据源 (sm+kol + 钱包标签 + USD金额)
