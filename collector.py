@@ -338,9 +338,10 @@ Score: {sig['score']}{okx_note} | Tags: {tags_str}{lp_info}
 Steps (max 3 tool calls):
 1. web_search "{sig['symbol']} token crypto" — news/articles.
 2. web_search "{sig['symbol']} twitter meme coin" — social buzz.
-3. If ANY of: KOL shilling / major news / exchange listing / Musk/Trump/CZ mention / hot narrative → ★★★ → push TG.
+3. If ANY of: KOL shilling / major news / exchange listing / Musk/Trump/CZ mention / hot narrative → ★★★.
 4. Else → SKIP.
 
+IMPORTANT: Do NOT use send_message. Only respond with text.
 Respond ONE line: PUSHED: symbol — narrative | SKIP: symbol — reason (≤10 words)."""
 
 @retry(max_attempts=2, base_delay=5.0)
