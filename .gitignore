@@ -2,8 +2,9 @@
 *.log
 *.pid
 __pycache__/
-.env
 
-# Sensitive
+# Secrets & env
+.env
+memerander_bridge.py
 restart_gateway.sh
 gateway_restart.log

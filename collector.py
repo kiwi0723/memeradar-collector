@@ -27,12 +27,19 @@ from datetime import datetime
 from collections import defaultdict
 from functools import wraps
 
+# Load .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # === 配置 ===
 HERMES_API = "http://127.0.0.1:8642/v1/chat/completions"
 HERMES_MODEL = "hermes-agent"
 
-CHAINS_GMGN = ["sol", "eth", "base"]
-CHAINS_OKX  = {"sol": "solana", "eth": "ethereum", "base": "base"}
+CHAINS_GMGN = ["sol", "eth", "base", "bsc"]
+CHAINS_OKX  = {"sol": "solana", "eth": "ethereum", "base": "base", "bsc": "bsc"}
 
 POLL_INTERVAL = 12
 CHAIN_POLL_DELAY = 1.0
@@ -51,7 +58,7 @@ SCORE_TAG_PREMIUM = {       # 高价值标签
 SCORE_OKX_VERIFY = 3.0      # OKX 双源确认加分
 SCORE_VOLUME_LOG = 1.5      # log10(volume) 系数
 
-MAX_BUFFER_PER_TOKEN = 50
+MAX_BUFFER_PER_TOKEN = int(os.environ.get("MAX_BUFFER_PER_TOKEN", 50))
 POST_COOLDOWN = 600
 MAX_POSTS_PER_CYCLE = 2
 
@@ -62,7 +69,22 @@ OKX_VERIFIED = set()
 OKX_VERIFIED_TS = {}
 OKX_VERIFY_TTL = 300
 
-LOG_FILE = os.path.expanduser("~/crypto-trading/collector.log")
+# ── 双推: Hermes 分类后, ★★★ 同时发旧bot ──
+OLD_TG_TOKEN = os.environ.get("TG_PUSH_TOKEN", "")
+OLD_TG_CHAT = os.environ.get("TG_PUSH_CHAT", "")
+
+def push_to_old_bot(text: str):
+    """直接调 Telegram API 发给旧bot"""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{OLD_TG_TOKEN}/sendMessage",
+            json={"chat_id": OLD_TG_CHAT, "text": text},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector.log")
 
 def log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -314,9 +336,9 @@ Buy: ${sig['total_usd']:,.0f}
 Score: {sig['score']}{okx_note} | Tags: {tags_str}{lp_info}
 
 Steps (max 3 tool calls):
-1. mcp_opennews_search_news(keyword="{sig['symbol']}") — news.
-2. mcp_twitter_search_twitter(keywords="{sig['symbol']}") — tweets.
-3. If NEWS/TWEETS → Musk/Trump/CZ/Binance → ★★★ → push TG.
+1. web_search "{sig['symbol']} token crypto" — news/articles.
+2. web_search "{sig['symbol']} twitter meme coin" — social buzz.
+3. If ANY of: KOL shilling / major news / exchange listing / Musk/Trump/CZ mention / hot narrative → ★★★ → push TG.
 4. Else → SKIP.
 
 Respond ONE line: PUSHED: symbol — narrative | SKIP: symbol — reason (≤10 words)."""
@@ -328,7 +350,7 @@ def send_to_hermes(sig: dict) -> str:
         "model": HERMES_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 100,
-    }, timeout=90)
+    }, timeout=180)
     if r.status_code == 200:
         return r.json()["choices"][0]["message"]["content"].strip()
     raise RuntimeError(f"HTTP {r.status_code}")
@@ -368,6 +390,9 @@ def main():
                 if result is None:
                     result = "RETRY_EXHAUSTED"
                 log(f"← Hermes: {result}")
+                # ★★★ 双推到旧bot
+                if result and result.startswith("PUSHED"):
+                    push_to_old_bot(f"🚨 {result}\n\nCA: `{sig['address']}`\nScore: {sig['score']} | {sig['chain']}")
                 pushed += 1
 
             if cycle % 5 == 0:
