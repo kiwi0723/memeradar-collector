@@ -1,0 +1,9 @@
+# Logs & runtime
+*.log
+*.pid
+__pycache__/
+.env
+
+# Sensitive
+restart_gateway.sh
+gateway_restart.log
