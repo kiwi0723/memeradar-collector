@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Collector v6 — 双源交叉验证信号采集器 (web叙事 + 四链)
+Collector v7 — 低延迟: 30s窗口 + 并行Hermes + 去掉web搜索
 
 数据源:
   GMGN  — 主数据源 (sm+kol + 钱包标签 + USD金额)
@@ -26,6 +26,7 @@ import math
 from datetime import datetime
 from collections import defaultdict
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load .env
 try:
@@ -43,7 +44,7 @@ CHAINS_OKX  = {"sol": "solana", "eth": "ethereum", "base": "base", "bsc": "bsc"}
 
 POLL_INTERVAL = 12
 CHAIN_POLL_DELAY = 1.0
-CLUSTER_WINDOW = 120
+CLUSTER_WINDOW = 30
 
 # 信号打分权重
 SIGNAL_THRESHOLD = 10       # 最低分数才推 Hermes
@@ -327,7 +328,7 @@ def build_hermes_prompt(sig: dict) -> str:
     lp_info = f" | launchpad: {sig['launchpad']}" if sig.get("launchpad") else ""
     okx_note = " | ✅OKX" if sig.get("okx_verified") else ""
 
-    return f"""Quick SM cluster — classify & push if ★★★:
+    return f"""Quick SM cluster — classify & push if ★★★ (NO web search, fast only):
 
 Token: {sig['symbol']} {emoji}{sig['chain']}
 CA: {sig['address']}
@@ -336,27 +337,24 @@ Buy: ${sig['total_usd']:,.0f}
 Score: {sig['score']}{okx_note} | Tags: {tags_str}{lp_info}
 GMGN: https://gmgn.ai/{sig['chain'].lower()}/token/{sig['address']}
 
-Steps (max 5 tool calls):
+Steps (max 3 tool calls, no web_search):
 1. Open GMGN link → check Twitter/website/social links on token page.
-2. If Twitter link found → search that tweet/account for narrative.
-3. web_search "{sig['symbol']} token crypto" — news/articles.
-4. If ANY of: CZ/Binance tweet / KOL shilling / major news / exchange listing / Musk/Trump mention / hot narrative → ★★★.
-5. Else → SKIP.
+2. If ANY of: CZ/Binance tweet / KOL shilling / major news / hot narrative / notable dev → ★★★.
+3. Else → SKIP.
 
-IMPORTANT: Do NOT use send_message. Only respond with text.
+IMPORTANT: Do NOT use web_search. Do NOT use send_message. Only respond with text.
 Reply EXACTLY one line, no prefix, no explanation:
 PUSHED: symbol — narrative
 or
 SKIP: symbol — reason"""
 
-@retry(max_attempts=2, base_delay=5.0)
 def send_to_hermes(sig: dict) -> str:
     prompt = build_hermes_prompt(sig)
     r = requests.post(HERMES_API, json={
         "model": HERMES_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 100,
-    }, timeout=300)
+    }, timeout=60)
     if r.status_code == 200:
         return r.json()["choices"][0]["message"]["content"].strip()
     raise RuntimeError(f"HTTP {r.status_code}")
@@ -366,7 +364,7 @@ def send_to_hermes(sig: dict) -> str:
 # ═══════════════════════════════════════════
 
 def main():
-    log("=== Collector v5 — retry + signal scoring ===")
+    log("=== Collector v7 — fast: 30s window + parallel + no web search ===")
     log(f"Chains: GMGN {CHAINS_GMGN} | OKX {list(CHAINS_OKX.values())}")
     log(f"Score threshold: ≥{SIGNAL_THRESHOLD} | Weights: wallet×{SCORE_WALLET_BASE} SM+{SCORE_SM_BONUS} KOL+{SCORE_KOL_BONUS} OKX+{SCORE_OKX_VERIFY}")
 
@@ -387,30 +385,43 @@ def main():
                 time.sleep(CHAIN_POLL_DELAY)
 
             signals = cluster_signals()
-            pushed = 0
-            for sig in signals[:MAX_POSTS_PER_CYCLE]:
-                SEEN_POSTS[sig["address"]] = now
-                verif = "✅OKX" if sig.get("okx_verified") else "⚠️GMGN"
-                log(f"→ {verif} {sig['symbol']}({sig['chain']}) score={sig['score']} | {sig['wallet_count']}w | ${sig['total_usd']:,.0f}")
-                result = send_to_hermes(sig)
-                if result is None:
-                    result = "RETRY_EXHAUSTED"
-                log(f"← Hermes: {result}")
-                # ★★★ 推送到旧bot
-                if result and "PUSHED" in result:
-                    # 提取叙事
-                    narrative = result.replace("PUSHED:", "").strip()
-                    chain_emoji = {"SOL":"🟣","ETH":"🔵","BASE":"🔵","BSC":"🟡"}
-                    emoji = chain_emoji.get(sig["chain"], "")
-                    msg = (
-                        f"🚨 *{sig['symbol']}* {emoji}{sig['chain']}\n\n"
-                        f"🎯 {narrative}\n\n"
-                        f"📊 {sig['wallet_count']}w | ${sig['total_usd']:,.0f} | Score {sig['score']}\n"
-                        f"{verif} | SM:{sig['sm_count']} KOL:{sig['kol_count']}\n\n"
-                        f"`{sig['address']}`"
-                    )
-                    push_to_old_bot(msg)
-                pushed += 1
+
+            if signals:
+                batch = signals[:MAX_POSTS_PER_CYCLE]
+
+                # Mark SEEN upfront (prevent parallel dupes)
+                for sig in batch:
+                    SEEN_POSTS[sig["address"]] = now
+                    verif = "✅OKX" if sig.get("okx_verified") else "⚠️GMGN"
+                    log(f"→ {verif} {sig['symbol']}({sig['chain']}) score={sig['score']} | {sig['wallet_count']}w | ${sig['total_usd']:,.0f}")
+
+                # Parallel Hermes analysis
+                def analyze(sig):
+                    try:
+                        result = send_to_hermes(sig)
+                        return (sig, result or "TIMEOUT")
+                    except Exception as e:
+                        return (sig, f"ERROR: {e}")
+
+                with ThreadPoolExecutor(max_workers=MAX_POSTS_PER_CYCLE) as pool:
+                    futures = {pool.submit(analyze, sig): sig for sig in batch}
+                    for future in as_completed(futures):
+                        sig, result = future.result()
+                        log(f"← Hermes [{sig['symbol']}]: {result}")
+                        # ★★★ 推送到旧bot
+                        if result and "PUSHED" in result:
+                            narrative = result.replace("PUSHED:", "").strip()
+                            chain_emoji_map = {"SOL":"🟣","ETH":"🔵","BASE":"🔵","BSC":"🟡"}
+                            emoji = chain_emoji_map.get(sig["chain"], "")
+                            verif = "✅OKX" if sig.get("okx_verified") else "⚠️GMGN"
+                            msg = (
+                                f"🚨 *{sig['symbol']}* {emoji}{sig['chain']}\n\n"
+                                f"🎯 {narrative}\n\n"
+                                f"📊 {sig['wallet_count']}w | ${sig['total_usd']:,.0f} | Score {sig['score']}\n"
+                                f"{verif} | SM:{sig['sm_count']} KOL:{sig['kol_count']}\n\n"
+                                f"`{sig['address']}`"
+                            )
+                            push_to_old_bot(msg)
 
             if cycle % 5 == 0:
                 log(f"Status: c={cycle} | new={total_new} | buf={len(TRADE_BUFFER)} | okx={len(OKX_VERIFIED)} | seen={len(SEEN_POSTS)}")
