@@ -334,12 +334,14 @@ CA: {sig['address']}
 Buyers: {sig['wallet_count']}w (SM:{sig['sm_count']} KOL:{sig['kol_count']})
 Buy: ${sig['total_usd']:,.0f}
 Score: {sig['score']}{okx_note} | Tags: {tags_str}{lp_info}
+GMGN: https://gmgn.ai/{sig['chain'].lower()}/token/{sig['address']}
 
-Steps (max 3 tool calls):
-1. web_search "{sig['symbol']} token crypto" — news/articles.
-2. web_search "{sig['symbol']} twitter meme coin" — social buzz.
-3. If ANY of: KOL shilling / major news / exchange listing / Musk/Trump/CZ mention / hot narrative → ★★★.
-4. Else → SKIP.
+Steps (max 5 tool calls):
+1. Open GMGN link → check Twitter/website/social links on token page.
+2. If Twitter link found → search that tweet/account for narrative.
+3. web_search "{sig['symbol']} token crypto" — news/articles.
+4. If ANY of: CZ/Binance tweet / KOL shilling / major news / exchange listing / Musk/Trump mention / hot narrative → ★★★.
+5. Else → SKIP.
 
 IMPORTANT: Do NOT use send_message. Only respond with text.
 Respond ONE line: PUSHED: symbol — narrative | SKIP: symbol — reason (≤10 words)."""
@@ -351,7 +353,7 @@ def send_to_hermes(sig: dict) -> str:
         "model": HERMES_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 100,
-    }, timeout=180)
+    }, timeout=300)
     if r.status_code == 200:
         return r.json()["choices"][0]["message"]["content"].strip()
     raise RuntimeError(f"HTTP {r.status_code}")
