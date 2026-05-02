@@ -344,7 +344,10 @@ Steps (max 5 tool calls):
 5. Else → SKIP.
 
 IMPORTANT: Do NOT use send_message. Only respond with text.
-Respond ONE line: PUSHED: symbol — narrative | SKIP: symbol — reason (≤10 words)."""
+Reply EXACTLY one line, no prefix, no explanation:
+PUSHED: symbol — narrative
+or
+SKIP: symbol — reason"""
 
 @retry(max_attempts=2, base_delay=5.0)
 def send_to_hermes(sig: dict) -> str:
@@ -393,9 +396,20 @@ def main():
                 if result is None:
                     result = "RETRY_EXHAUSTED"
                 log(f"← Hermes: {result}")
-                # ★★★ 双推到旧bot
-                if result and result.startswith("PUSHED"):
-                    push_to_old_bot(f"🚨 {result}\n\nCA: `{sig['address']}`\nScore: {sig['score']} | {sig['chain']}")
+                # ★★★ 推送到旧bot
+                if result and "PUSHED" in result:
+                    # 提取叙事
+                    narrative = result.replace("PUSHED:", "").strip()
+                    chain_emoji = {"SOL":"🟣","ETH":"🔵","BASE":"🔵","BSC":"🟡"}
+                    emoji = chain_emoji.get(sig["chain"], "")
+                    msg = (
+                        f"🚨 *{sig['symbol']}* {emoji}{sig['chain']}\n\n"
+                        f"🎯 {narrative}\n\n"
+                        f"📊 {sig['wallet_count']}w | ${sig['total_usd']:,.0f} | Score {sig['score']}\n"
+                        f"{verif} | SM:{sig['sm_count']} KOL:{sig['kol_count']}\n\n"
+                        f"`{sig['address']}`"
+                    )
+                    push_to_old_bot(msg)
                 pushed += 1
 
             if cycle % 5 == 0:
