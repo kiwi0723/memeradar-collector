@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-Collector v7 — 低延迟: 30s窗口 + 并行Hermes + 去掉web搜索
+Collector v8.0-nohermes — ZERO token, pure rule engine
 
 数据源:
-  GMGN  — 主数据源 (sm+kol + 钱包标签 + USD金额)
-  OKX   — 交叉验证源 (tracker activities, 免费)
+  GMGN  — 主数据源 (gmgn-cli, sm+kol+钱包标签+USD)
+  OKX   — 交叉验证 (tracker activities, 免费)
+  DEXScreener — MC fallback (非SOL链, 免费)
 
-信号打分:
-  wallet_score   — 钱包数 × 来源权重
-  volume_score   — 买入量对数
-  tag_score      — 标签稀有度
-  okx_bonus      — 双源确认加成
-  → score ≥ 阈值 → 推 Hermes
-
-分析: Hermes + 6551 MCP (opennews + twitter) + gmgn-token
-推送: Telegram (仅★★★)
+分析: 规则引擎 (gmgn-cli + DEXScreener, 零DeepSeek token)
+推送: Telegram 直接 Bot API (零Hermes)
 """
 
-import requests
+VERSION = "v8.0-nohermes"
+
 import json
 import time
 import subprocess
@@ -27,6 +22,7 @@ from datetime import datetime
 from collections import defaultdict
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 
 # Load .env
 try:
@@ -35,19 +31,17 @@ try:
 except ImportError:
     pass
 
-# === 配置 ===
-HERMES_API = "http://127.0.0.1:8642/v1/chat/completions"
-HERMES_MODEL = "hermes-agent"
+
+# === 配置 (v8: 去掉Hermes, gmgn-cli + 规则引擎) ===
 
 CHAINS_GMGN = ["sol", "eth", "base", "bsc"]
 CHAINS_OKX  = {"sol": "solana", "eth": "ethereum", "base": "base", "bsc": "bsc"}
 
 POLL_INTERVAL = 12
 CHAIN_POLL_DELAY = 1.0
-CLUSTER_WINDOW = 30
+CLUSTER_WINDOW = 180
 
-# 信号打分权重
-SIGNAL_THRESHOLD = 10       # 最低分数才推 Hermes
+SIGNAL_THRESHOLD = 15       # 最低分数才进入分析
 SCORE_WALLET_BASE = 2.0     # 每个钱包基础分
 SCORE_SM_BONUS = 0.3        # smart_money 加成
 SCORE_KOL_BONUS = 0.5       # KOL 加成 (kol更值钱)
@@ -60,8 +54,25 @@ SCORE_OKX_VERIFY = 3.0      # OKX 双源确认加分
 SCORE_VOLUME_LOG = 1.5      # log10(volume) 系数
 
 MAX_BUFFER_PER_TOKEN = int(os.environ.get("MAX_BUFFER_PER_TOKEN", 50))
-POST_COOLDOWN = 600
+POST_COOLDOWN = 3600       # 同一CA冷却1小时（从600s）
 MAX_POSTS_PER_CYCLE = 2
+MIN_MC = 50000             # 最低市值$50K，低于不推
+
+
+# v8 规则引擎分类参数
+PUSH_MIN_MC = 50000
+CTO_MIN_SM = 10
+CTO_MAX_AGE_HOURS = 168
+STRONG_KOL_MIN = 5
+STRONG_SM_MIN = 20
+HIGH_SCORE_OKX = 25
+HIGH_SM_SOLO = 30
+BORDERLINE_SCORE = 20
+BUNDLE_AUTO_SKIP = 0.60
+
+POST_COOLDOWN = 3600       # 同一CA冷却1小时（从600s）
+MAX_POSTS_PER_CYCLE = 2
+MIN_MC = 50000             # 最低市值$50K，低于不推
 
 SEEN_POSTS = {}
 TRADE_BUFFER = defaultdict(list)
@@ -70,16 +81,26 @@ OKX_VERIFIED = set()
 OKX_VERIFIED_TS = {}
 OKX_VERIFY_TTL = 300
 
-# ── 双推: Hermes 分类后, ★★★ 同时发旧bot ──
 OLD_TG_TOKEN = os.environ.get("TG_PUSH_TOKEN", "")
 OLD_TG_CHAT = os.environ.get("TG_PUSH_CHAT", "")
+
+def escape_mdv2(text: str) -> str:
+    """Escape MarkdownV2 special chars, preserving intentional *bold* and `code`"""
+    # Temp placeholders to protect intentional formatting
+    text = text.replace(r'*', '\x00B\x00')
+    text = text.replace(r'`', '\x00C\x00')
+    for ch in '_*[]()~`>#+-=|{}.!':
+        text = text.replace(ch, '\\' + ch)
+    text = text.replace('\x00B\x00', '*')
+    text = text.replace('\x00C\x00', '`')
+    return text
 
 def push_to_old_bot(text: str):
     """直接调 Telegram API 发给旧bot"""
     try:
         requests.post(
             f"https://api.telegram.org/bot{OLD_TG_TOKEN}/sendMessage",
-            json={"chat_id": OLD_TG_CHAT, "text": text},
+            json={"chat_id": OLD_TG_CHAT, "text": escape_mdv2(text), "parse_mode": "MarkdownV2"},
             timeout=5
         )
     except Exception:
@@ -273,10 +294,16 @@ def cluster_signals() -> list:
         launchpad = fresh[-1].get("launchpad", "")
         all_tags = set()
         sm_count = kol_count = 0
+        bundle_wallets = 0
+        bundle_addresses = []
+        bundle_tags = {"fresh_wallet", "smart_degen", "photon", "padre", "sandwich_bot", "mev_bot"}
         for t in fresh:
             all_tags.update(t.get("tags", []))
             if t.get("source") == "sm": sm_count += 1
             elif t.get("source") == "kol": kol_count += 1
+            if bundle_tags & set(t.get("tags", [])):
+                bundle_wallets += 1
+                bundle_addresses.append(t.get("wallet", ""))
 
         if len(wallet_set) < 2:  # 至少2个钱包才打分
             continue
@@ -307,6 +334,8 @@ def cluster_signals() -> list:
             "launchpad": launchpad,
             "okx_verified": okx_verified,
             "score": sc,
+            "bundle_wallets": bundle_wallets,
+            "bundle_addresses": bundle_addresses,
             "ts": now,
         })
 
@@ -318,53 +347,204 @@ def cluster_signals() -> list:
     return signals
 
 # ═══════════════════════════════════════════
-# Hermes 通信
-# ═══════════════════════════════════════════
-
-def build_hermes_prompt(sig: dict) -> str:
-    chain_emoji = {"SOL": "🟣", "ETH": "🔵", "BASE": "🔵"}
-    emoji = chain_emoji.get(sig["chain"], "")
-    tags_str = ", ".join(sig.get("tags", [])[:5])
-    lp_info = f" | launchpad: {sig['launchpad']}" if sig.get("launchpad") else ""
-    okx_note = " | ✅OKX" if sig.get("okx_verified") else ""
-
-    return f"""Quick SM cluster — classify & push if ★★★ (NO web search, fast only):
-
-Token: {sig['symbol']} {emoji}{sig['chain']}
-CA: {sig['address']}
-Buyers: {sig['wallet_count']}w (SM:{sig['sm_count']} KOL:{sig['kol_count']})
-Buy: ${sig['total_usd']:,.0f}
-Score: {sig['score']}{okx_note} | Tags: {tags_str}{lp_info}
-GMGN: https://gmgn.ai/{sig['chain'].lower()}/token/{sig['address']}
-
-Steps (max 3 tool calls, no web_search):
-1. Open GMGN link → check Twitter/website/social links on token page.
-2. If ANY of: CZ/Binance tweet / KOL shilling / major news / hot narrative / notable dev → ★★★.
-3. Else → SKIP.
-
-IMPORTANT: Do NOT use web_search. Do NOT use send_message. Only respond with text.
-Reply EXACTLY one line, no prefix, no explanation:
-PUSHED: symbol — narrative
-or
-SKIP: symbol — reason"""
-
-def send_to_hermes(sig: dict) -> str:
-    prompt = build_hermes_prompt(sig)
-    r = requests.post(HERMES_API, json={
-        "model": HERMES_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 100,
-    }, timeout=60)
-    if r.status_code == 200:
-        return r.json()["choices"][0]["message"]["content"].strip()
-    raise RuntimeError(f"HTTP {r.status_code}")
 
 # ═══════════════════════════════════════════
+# GMGN Token Info + 规则分类 (v8: 取代Hermes)
+# ═══════════════════════════════════════════
+
+@retry(max_attempts=2, base_delay=2.0)
+def fetch_gmgn_token_info(address: str, chain: str) -> dict:
+    """拉取GMGN token完整信息 (免费, 零token)"""
+    result = subprocess.run(
+        ["gmgn-cli", "token", "info", "--raw", "--chain", chain, "--address", address],
+        capture_output=True, text=True, timeout=15
+    )
+    if result.returncode != 0:
+        raise RuntimeError("gmgn-cli error: " + str(result.stderr[:100]))
+    data = json.loads(result.stdout)
+    return data if data else {}
+
+@retry(max_attempts=1, base_delay=1.0)
+def fetch_pumpfun_description(address: str) -> str:
+    """Pump.fun代币description"""
+    try:
+        r = requests.get(
+            "https://frontend-api.pump.fun/coins/" + address,
+            timeout=5, headers={"User-Agent": "collector/8.0"}
+        )
+        if r.status_code == 200:
+            return r.json().get("description", "") or ""
+    except:
+        pass
+    return ""
+
+@retry(max_attempts=1, base_delay=1.0)
+def fetch_dexscreener_info(address: str) -> dict:
+    """DEXScreener API - MC, social links, on-chain data (free, zero token)"""
+    try:
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/tokens/" + address,
+            timeout=10, headers={"User-Agent": "collector/8.0"}
+        )
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        pairs = data.get("pairs", [])
+        if not pairs:
+            return {}
+        p = pairs[0]
+        mc = p.get("marketCap", 0)
+        if mc is None:
+            mc = 0
+        try:
+            mc = float(mc)
+        except (ValueError, TypeError):
+            mc = 0
+        return {
+            "mc": mc,
+            "price": float(p.get("priceUsd", 0) or 0),
+            "chain": p.get("chainId", ""),
+            "created": p.get("pairCreatedAt", 0),
+            "twitter": (p.get("info", {}) or {}).get("twitter", ""),
+            "website": "",
+        }
+    except Exception as e:
+        log("DEX error for " + address[:10] + ": " + str(e)[:100])
+        return {}
+
+def extract_narrative(info: dict) -> str:
+    """从GMGN/Pump.fun/Twitter提取叙事文本"""
+    link = info.get("link", {})
+
+    # 1. GMGN description
+    desc = info.get("description", "")
+    if desc and len(desc) > 5:
+        return desc[:150]
+
+    # 2. Pump.fun description
+    addr = info.get("address", "")
+    launchpad = info.get("launchpad", "").lower()
+    if launchpad == "pump" and addr:
+        pf_desc = fetch_pumpfun_description(addr)
+        if pf_desc:
+            return pf_desc[:150]
+
+    # 3. Twitter bio via fxtwitter
+    twitter = link.get("twitter_username", "")
+    if twitter:
+        username = twitter.split("/status/")[0].lstrip("/").split("/")[-1] if "/status/" in twitter else twitter
+        if username:
+            try:
+                r = requests.get("https://api.fxtwitter.com/" + username, timeout=5)
+                if r.status_code == 200:
+                    bio = r.json().get("user", {}).get("description", "")
+                    if bio:
+                        return bio[:150]
+            except:
+                pass
+
+    # 4. Website fallback
+    website = link.get("website", "")
+    if website:
+        return "🔗 " + website[:120]
+
+    return ""
+
+def classify_and_narrate(sig: dict, info: dict) -> tuple:
+    """规则引擎: Returns (verdict, narrative, mc_usd, creation_time_str)"""
+    if not info:
+        return ("SKIP", "gmgn-cli无数据", 0, "")
+
+    dev = info.get("dev", {})
+    link = info.get("link", {})
+    stats = info.get("wallet_tags_stat", {})
+    stat = info.get("stat", {})
+
+    sm_wallets = stats.get("smart_wallets", 0)
+    kol_wallets = stats.get("renowned_wallets", 0)
+    cto_flag = dev.get("cto_flag", 0)
+    creator_status = dev.get("creator_token_status", "")
+
+    try:
+        bundler_pct = float(stat.get("top_bundler_trader_percentage", 0))
+    except (ValueError, TypeError):
+        bundler_pct = 0
+
+    try:
+        price = float(info.get("price", 0))
+        supply = int(info.get("circulating_supply", 0))
+        decimals = int(info.get("decimals", 0))
+        mc_usd = price * (supply / (10**decimals)) if decimals else price * supply
+    except (ValueError, TypeError):
+        mc_usd = 0
+
+    # DEXScreener fallback — gmgn-cli 对非SOL链返回decimals=0，导致MC极小
+    dx = {}
+    if mc_usd < 1:  # MC < $1 = effectively zero, gmgn decimals broken
+        dx = fetch_dexscreener_info(sig["address"])
+        if dx and dx.get("mc", 0) > 0:
+            mc_usd = dx["mc"]
+
+    creation_ts = info.get("creation_timestamp", 0)
+    if creation_ts == 0 and dx.get("created", 0) > 0:
+        creation_ts = dx["created"] / 1000  # DEXScreener uses ms
+    creation_time = datetime.fromtimestamp(creation_ts).strftime("%Y-%m-%d %H:%M") if creation_ts else ""
+    age_hours = (time.time() - creation_ts) / 3600 if creation_ts else 9999
+
+    narrative = extract_narrative(info)
+    # Enrich narrative from DEXScreener if gmgn has no socials
+    if not narrative and dx:
+        if dx.get("twitter"):
+            narrative = "🐦 " + dx["twitter"]
+        elif dx.get("website"):
+            narrative = "🔗 " + dx["website"]
+    has_social = bool(link.get("twitter_username") or link.get("website"))
+
+    # ═══ 规则引擎 ═══
+
+    # 🔴 高捆绑率自动SKIP
+    if bundler_pct > BUNDLE_AUTO_SKIP:
+        return ("SKIP", "捆绑率" + str(int(bundler_pct * 100)) + "%", mc_usd, creation_time)
+
+    # 🔴 Dev清仓无CTO
+    if creator_status == "creator_close" and not cto_flag:
+        return ("SKIP", "Dev已清仓无CTO", mc_usd, creation_time)
+
+    # 🟢 CTO + SM足够 + 新鲜
+    if cto_flag and sm_wallets >= CTO_MIN_SM and age_hours < CTO_MAX_AGE_HOURS:
+        return ("PUSHED", narrative or "🔥CTO社区接管", mc_usd, creation_time)
+
+    # 🟢 OKX双源 + 高评分 + 明显SM
+    if sig.get("okx_verified") and sig["score"] >= HIGH_SCORE_OKX and sm_wallets >= 15:
+        fb = "SM" + str(sm_wallets) + "+KOL" + str(kol_wallets) + " OKX验证"
+        return ("PUSHED", narrative or fb, mc_usd, creation_time)
+
+    # 🟢 强KOL入场
+    if kol_wallets >= STRONG_KOL_MIN and sm_wallets >= STRONG_SM_MIN:
+        fb = "KOL" + str(kol_wallets) + "+SM" + str(sm_wallets) + "集体入场"
+        return ("PUSHED", narrative or fb, mc_usd, creation_time)
+
+    # 🟢 高SM + 有叙事
+    if sm_wallets >= HIGH_SM_SOLO and narrative:
+        return ("PUSHED", narrative, mc_usd, creation_time)
+
+    # 🔴 无叙事无社交
+    if not narrative and not has_social:
+        return ("SKIP", "无叙事无社交", mc_usd, creation_time)
+
+    # 🟡 边界: 评分>=20 + 有社交
+    if sig["score"] >= BORDERLINE_SCORE and has_social:
+        fb = "信号SM" + str(sm_wallets) + "|评分" + str(sig["score"])
+        return ("PUSHED", narrative or fb, mc_usd, creation_time)
+
+    reason = "评分" + str(sig["score"]) + "KOL" + str(kol_wallets) + "不足"
+    return ("SKIP", reason, mc_usd, creation_time)
+
 # 主循环
 # ═══════════════════════════════════════════
 
 def main():
-    log("=== Collector v7 — fast: 30s window + parallel + no web search ===")
+    log(f"=== Collector {VERSION} — fast: 30s window + parallel + no web search ===")
     log(f"Chains: GMGN {CHAINS_GMGN} | OKX {list(CHAINS_OKX.values())}")
     log(f"Score threshold: ≥{SIGNAL_THRESHOLD} | Weights: wallet×{SCORE_WALLET_BASE} SM+{SCORE_SM_BONUS} KOL+{SCORE_KOL_BONUS} OKX+{SCORE_OKX_VERIFY}")
 
@@ -396,34 +576,66 @@ def main():
                     log(f"→ {verif} {sig['symbol']}({sig['chain']}) score={sig['score']} | {sig['wallet_count']}w | ${sig['total_usd']:,.0f}")
 
                 # Parallel Hermes analysis
-                def analyze(sig):
+                # v8: gmgn-cli + 规则引擎 (零DeepSeek token)
+                def analyze_v8(sig):
                     try:
-                        result = send_to_hermes(sig)
-                        return (sig, result or "TIMEOUT")
+                        info = fetch_gmgn_token_info(sig["address"], sig["chain"].lower())
+                        verdict, narrative, mc_usd, crtime = classify_and_narrate(sig, info)
+                        return (sig, verdict, narrative, mc_usd, crtime)
                     except Exception as e:
-                        return (sig, f"ERROR: {e}")
+                        return (sig, "SKIP", "ERROR:" + str(e)[:50], 0, "")
 
                 with ThreadPoolExecutor(max_workers=MAX_POSTS_PER_CYCLE) as pool:
-                    futures = {pool.submit(analyze, sig): sig for sig in batch}
+                    futures = {pool.submit(analyze_v8, sig): sig for sig in batch}
                     for future in as_completed(futures):
-                        sig, result = future.result()
-                        log(f"← Hermes [{sig['symbol']}]: {result}")
-                        # ★★★ 推送到旧bot
-                        if result and "PUSHED" in result:
-                            narrative = result.replace("PUSHED:", "").strip()
-                            chain_emoji_map = {"SOL":"🟣","ETH":"🔵","BASE":"🔵","BSC":"🟡"}
-                            emoji = chain_emoji_map.get(sig["chain"], "")
-                            verif = "✅OKX" if sig.get("okx_verified") else "⚠️GMGN"
-                            msg = (
-                                f"🚨 *{sig['symbol']}* {emoji}{sig['chain']}\n\n"
-                                f"🎯 {narrative}\n\n"
-                                f"📊 {sig['wallet_count']}w | ${sig['total_usd']:,.0f} | Score {sig['score']}\n"
-                                f"{verif} | SM:{sig['sm_count']} KOL:{sig['kol_count']}\n\n"
-                                f"`{sig['address']}`"
-                            )
-                            push_to_old_bot(msg)
+                        sig, verdict, narrative, mc_usd, crtime = future.result()
 
-            if cycle % 5 == 0:
+                        mc_s = "$" + format(int(mc_usd), ",") if mc_usd > 0 else "?"
+                        log("v " + verdict + " [" + sig["symbol"] + "]: " + narrative[:60] + " | MC:" + mc_s)
+
+                        if verdict != "PUSHED":
+                            continue
+
+                        if mc_usd < PUSH_MIN_MC:
+                            log("v SKIP [" + sig["symbol"] + "]: MC $" + format(int(mc_usd), ",") + " < $" + format(PUSH_MIN_MC, ","))
+                            continue
+
+                        ce = {"SOL":"🟣","ETH":"🔵","BASE":"🔵","BSC":"🟡"}
+                        emoji = ce.get(sig["chain"], "")
+                        verif = "✅OKX" if sig.get("okx_verified") else "⚠️GMGN"
+
+                        parts = [
+                            "🚨 *" + sig["symbol"] + "* " + emoji + sig["chain"],
+                            "",
+                            "🎯 " + narrative,
+                        ]
+
+                        meta = []
+                        if mc_usd > 0:
+                            meta.append("💰 MC: $" + format(int(mc_usd), ","))
+                        if crtime:
+                            meta.append("🕐 " + crtime)
+                        meta.append("⭐ " + str(sig["score"]))
+                        parts.append(" | ".join(meta))
+
+                        bw = sig.get("bundle_wallets", 0)
+                        bundle_line = ""
+                        if bw >= 2:
+                            ratio = int(bw / sig["wallet_count"] * 100)
+                            bundle_line = "🧹 Bundle: " + str(bw) + "/" + str(sig["wallet_count"]) + "w (" + str(ratio) + "%)"
+
+                        parts += [
+                            "",
+                            verif + " | SM:" + str(sig["sm_count"]) + " KOL:" + str(sig["kol_count"]),
+                        ]
+                        if bundle_line:
+                            parts.append(bundle_line)
+                        parts += [
+                            "",
+                            "🔗 `" + sig["address"] + "`",
+                        ]
+                        msg = "\n".join(parts)
+                        push_to_old_bot(msg)
                 log(f"Status: c={cycle} | new={total_new} | buf={len(TRADE_BUFFER)} | okx={len(OKX_VERIFIED)} | seen={len(SEEN_POSTS)}")
 
         except KeyboardInterrupt:
